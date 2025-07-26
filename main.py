@@ -10,17 +10,20 @@ from models.target import YOLOv8TargetModel
 from psgan import PSGAN
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-YOLO_MODEL_DIR = './pretrained_models/best.pt'
+YOLO_MODEL_DIR = './pretrained_models/yolov8x-best.pt'
 
 BATCH_SIZE = 16
-NUM_WORKERS = 4
+NUM_WORKERS = 8
 
 IMG_SIZE = 256
 PATCH_SIZE = 32
 PATCH_RATIO = 0.05
 
 DISTORTION_THRESHOLD = 50.0
-LAMBDA_PATCH = 0.0018
+
+SIGMA_GAN = 0.01
+LAMBDA_PATCH = 0.002
+
 GAMMA_ADV = 1.0
 DISCRIMINATOR_LR = 0.0002
 GENERATOR_LR = 0.0002
@@ -68,6 +71,7 @@ def main():
     image_size=IMG_SIZE,
     lambda_patch=LAMBDA_PATCH,
     gamma_adv=GAMMA_ADV,
+    sigma_gan=SIGMA_GAN,
     patch_area_ratio=PATCH_RATIO,
     distortion_threshold=DISTORTION_THRESHOLD
   )

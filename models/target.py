@@ -5,7 +5,50 @@ import matplotlib.pyplot as plt
 from PIL import Image
 from ultralytics import YOLO
 import torchvision
+import os
+import matplotlib.patches as patches
 
+
+# def save_debug_images(images, all_boxes, all_confs, save_dir="debug_outputs_fianl_9dg_0.00388_patch15", prefix="batch"):
+def save_debug_images(images, all_boxes, all_confs, save_dir="debug/finalr9_g-1.0_l-0.00387", prefix="batch"):
+    """
+    Save a grid of images with the max-confidence predicted bounding box for each label.
+
+    Args:
+        images: Tensor [B, C, H, W] in [0,1] range
+        all_boxes: List of lists of [4] arrays (xyxy format per label per image, or None)
+        all_confs: List of lists of floats (confidence per label per image, or None)
+        save_dir: Directory to save images
+        prefix: Prefix for saved file name
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    images = images.detach().cpu()
+    B = images.shape[0]
+    cols = 4
+    rows = (B + cols - 1) // cols
+
+    fig, axes = plt.subplots(rows, cols, figsize=(cols*5, rows*5))
+    axes = axes.flatten()
+
+    for i in range(B):
+        img = images[i].permute(1, 2, 0).numpy()
+        axes[i].imshow(img)
+        axes[i].axis('off')
+        # Draw all max-confidence boxes for this image (one per label)
+        for box, conf in zip(all_boxes[i], all_confs[i]):
+            if box is not None:
+                x1, y1, x2, y2 = box
+                rect = patches.Rectangle((x1, y1), x2-x1, y2-y1, linewidth=2, edgecolor='r', facecolor='none')
+                axes[i].add_patch(rect)
+                axes[i].text(x1, y1, f"{conf:.2f}", color='yellow', fontsize=8, bbox=dict(facecolor='black', alpha=0.5))
+    # Hide unused axes
+    for j in range(B, len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
+    save_path = os.path.join(save_dir, f"{prefix}_debug.png")
+    plt.savefig(save_path)
+    plt.close(fig)
 
 class YOLOv8TargetModel:
     """
@@ -116,13 +159,17 @@ class YOLOv8TargetModel:
             
             return max_confidence
 
-    def compute_adv_loss(self, images, labels, iou_thresh=0.5, conf_thresh=0.1):
+    def compute_adv_loss(self, images, labels, iou_thresh=0.5, conf_thresh=0.1, debug=True, debug_prefix="batch"):
         """
         Computes adversarial loss based on max confidence of detections
         overlapping ground truth objects.
         """
         images = (images + 1.0) / 2.0
         batch_losses = []
+
+        # debug
+        all_boxes = []
+        all_confs = []
 
         for i in range(images.shape[0]):
             single_image = images[i:i+1]
@@ -141,6 +188,10 @@ class YOLOv8TargetModel:
 
             confidences = []
 
+            # debug
+            boxes_per_image = []
+            confs_per_image = []
+
             for gt in image_labels:
                 gt_box = gt[2:].unsqueeze(0)  # [1, 4]
 
@@ -148,6 +199,8 @@ class YOLOv8TargetModel:
 
                 if len(class_boxes) == 0:
                     confidences.append(fallback)
+                    boxes_per_image.append(None)
+                    confs_per_image.append(None)
                     continue
 
                 
@@ -163,8 +216,19 @@ class YOLOv8TargetModel:
                 if matched.any():
                     matched_scores = pred_confs[matched[0]]
                     confidence = matched_scores.max()
+
+                    # debug
+                    matched_boxes = class_boxes[matched[0]]
+                    max_idx = torch.argmax(matched_scores)
+                    max_box = matched_boxes[max_idx].detach().cpu().numpy()
+                    boxes_per_image.append(max_box)
+                    confs_per_image.append(confidence.item())
                 else:
                     confidence = fallback
+
+                    # debug
+                    boxes_per_image.append(None)
+                    confs_per_image.append(None)
 
                 confidences.append(confidence)
 
@@ -174,6 +238,13 @@ class YOLOv8TargetModel:
                 image_loss = fallback
 
             batch_losses.append(image_loss)
+
+            # debug
+            all_boxes.append(boxes_per_image)
+            all_confs.append(confs_per_image)
+        
+        if debug:
+            save_debug_images(images, all_boxes, all_confs, prefix=debug_prefix)
 
         return torch.stack(batch_losses).mean()
         

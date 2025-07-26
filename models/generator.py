@@ -11,7 +11,7 @@ class Generator(nn.Module):
     Where each Ck is a Convolution-LayerNorm-LeakyReLU layer with k filters
     and (4x4) spatial filters with stride 2.
     """
-    def __init__(self, input_channels=3, output_channels=3, input_size=56, dropout_prob=0.3):
+    def __init__(self, input_channels=3, output_channels=3, input_size=56, dropout_prob=0.5):
         super(Generator, self).__init__()
 
         # Parameters
@@ -76,7 +76,8 @@ class Generator(nn.Module):
             # nn.LayerNorm([64, size3-1, size3-1]),
             # nn.InstanceNorm2d(64),
             nn.Dropout2d(self.dropout_prob),
-            nn.LeakyReLU(self.leaky_slope)
+            nn.ReLU()
+            # nn.LeakyReLU(self.leaky_slope)
         )
 
         # C32
@@ -86,7 +87,8 @@ class Generator(nn.Module):
             # nn.LayerNorm([32, size2, size2]),
             # nn.InstanceNorm2d(32),
             nn.Dropout2d(self.dropout_prob),
-            nn.LeakyReLU(self.leaky_slope)
+            nn.ReLU()
+            # nn.LeakyReLU(self.leaky_slope)
         )
 
         # C16
@@ -96,7 +98,8 @@ class Generator(nn.Module):
             # nn.LayerNorm([16, size1, size1]),
             # nn.InstanceNorm2d(16),
             nn.Dropout2d(self.dropout_prob),
-            nn.LeakyReLU(self.leaky_slope)
+            nn.ReLU()
+            # nn.LeakyReLU(self.leaky_slope)
         )
 
         # C3

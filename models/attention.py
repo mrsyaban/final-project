@@ -254,11 +254,11 @@ class AttentionModel:
                 box_width = int(width * self.image_size)
                 box_height = int(height * self.image_size)
                 
-                # Calculate patch size based on bounding box area
-                box_area = box_width * box_height
-                patch_area = box_area * patch_area_ratio
-                patch_size = int(math.sqrt(patch_area))
-                patch_size = max(patch_size, 1)  # Minimum size of 1
+                # # Calculate patch size based on bounding box area
+                # box_area = box_width * box_height
+                # patch_area = box_area * patch_area_ratio
+                # patch_size = int(math.sqrt(patch_area))
+                # patch_size = max(patch_size, 1)  # Minimum size of 1
                 
                 # Get keypoints for this specific bounding box if available
                 box_keypoints = []
@@ -284,6 +284,11 @@ class AttentionModel:
                 else:
                     # Default empty mask if no keypoints for this box
                     shape_mask = torch.zeros(self.image_size, self.image_size, device=device)
+
+                shape_area = shape_mask.sum().item()
+                patch_area = shape_area * patch_area_ratio
+                patch_size = int(math.sqrt(patch_area))
+                patch_size = max(patch_size, 1)
                 
                 # Get hottest point coordinates
                 point = img_points[j]
@@ -444,14 +449,29 @@ class AttentionModel:
         
         # Extract hole region mask
         hole_region_mask = component_mask[y_min:y_max+1, x_min:x_max+1]
+
+                # Smooth the mask for soft edges
+        try:
+            import kornia
+            smooth_mask = kornia.filters.gaussian_blur2d(
+                hole_region_mask.unsqueeze(0).unsqueeze(0), (15, 15), (5, 5)
+            ).squeeze()
+        except ImportError:
+            smooth_mask = F.avg_pool2d(hole_region_mask.unsqueeze(0).unsqueeze(0), kernel_size=7, stride=1, padding=3).squeeze()
+
+        smooth_mask = torch.clamp(smooth_mask, 0, 1)
         
         # Apply patch
         for c in range(channels):
             original_region = image[c, y_min:y_max+1, x_min:x_max+1]
             patch_region = resized_patch[c]
             
-            blended_region = (original_region * (1.0 - hole_region_mask) + 
-                            patch_region * hole_region_mask)
+            # blended_region = (original_region * (1.0 - hole_region_mask) + 
+            #                 patch_region * hole_region_mask)
+            
+            blended_region = (original_region * (1.0 - smooth_mask) +
+                patch_region * smooth_mask)
+            
             image[c, y_min:y_max+1, x_min:x_max+1] = blended_region
 
     def visualize_attention_and_masks(self, images, attention_maps, patch_masks, patch_sizes, targets, num_samples=4):

@@ -428,7 +428,10 @@ class PSGANInference:
             split='test',  # Use validation split for evaluation
             batch_size=4,  # Smaller batch size for evaluation
             num_workers=2,
-            download_params=dataset_config
+            download_params=dataset_config,
+            attentive_dir="./constant/attentive_coordinate.json",
+            keypoints_dir="./constant/traffic_signs_keypoints.json",
+            relight_dir="./constant/relighting_params.json"
         )
 
         # Load seed patches

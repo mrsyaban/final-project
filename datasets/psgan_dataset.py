@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader
 import yaml
 from roboflow import Roboflow
 import json
+from torch.utils.data.distributed import DistributedSampler
 
 class PSGANDataset(Dataset):
     def __init__(self, dataset_path, split='train', transform=None, target_transform=None, attentive_dir=None, keypoints_dir=None, relight_dir=None):
@@ -30,7 +31,7 @@ class PSGANDataset(Dataset):
         if attentive_dir and os.path.exists(attentive_dir):
             with open(attentive_dir, 'r') as f:
                 self.hottest_points = json.load(f)
-                print(f"Loaded hottest points for {len(self.hottest_points)} images")
+                # print(f"Loaded hottest points for {len(self.hottest_points)} images")
         
         # Load keypoints data if provided
         self.keypoints_data = {}
@@ -40,13 +41,15 @@ class PSGANDataset(Dataset):
             with open(keypoints_dir, 'r') as f:
                 self.keypoints_data = json.load(f)
             print(f"Loaded keypoints for {len(self.keypoints_data)} images")
+        else:
+            print("gadaaa")
         
         # Load relighting parameters if provided
         self.relighting_params = {}
         if relight_dir and os.path.exists(relight_dir):
             with open(relight_dir, 'r') as f:
                 self.relighting_params = json.load(f)
-                print(f"Loaded relighting parameters for {len(self.relighting_params)} images")
+                # print(f"Loaded relighting parameters for {len(self.relighting_params)} images")
 
         # Load dataset configuration
         self.config_path = os.path.join(dataset_path, 'data.yaml')
@@ -88,7 +91,7 @@ class PSGANDataset(Dataset):
                         self.label_files.append(None)
         
         print(f"Loaded {len(self.image_files)} images from {split} split")
-        print(f"Classes: {self.classes}")
+        # print(f"Classes: {self.classes}")
 
     def __len__(self):
         return len(self.image_files)
@@ -282,8 +285,102 @@ def get_or_download_dataset(download_params, base_path="./"):
     
     return dataset_path
 
+
+
+
+def yolo_collate_fn(batch):
+    images = []
+    targets = []
+    filenames = []
+    keypoints_list = []
+    shapes_list = []
+    hottest_points_list = []
+    relighting_coeffs_list = []
+
+    for i, (img, boxes, filename, keypoints, shape, hottest_points, relighting_coeffs) in enumerate(batch):
+        images.append(img)
+        filenames.append(filename)
+        shapes_list.append(shape)
+        
+        
+        # Handle bounding boxes
+        if len(boxes) > 0:
+            # Add image index for tracking which image the boxes belong to
+            img_idx = torch.full((boxes.shape[0], 1), i, dtype=torch.float32)
+            target = torch.cat([img_idx, boxes], dim=1)  # [num_boxes, 6]
+            targets.append(target)
+            
+            # Handle keypoints
+            if keypoints.shape[0] > 0:
+                # Keypoints should be [num_boxes, num_keypoints_per_box, 2]
+                # We need to keep the hierarchical structure
+                img_idx_kp = i  # Just use the integer index
+                # Store the image index separately with the keypoints
+                keypoints_list.append((img_idx_kp, keypoints))
+            
+            # Handle hottest points
+            if hottest_points.shape[0] > 0:
+                # Hottest points should be [num_boxes, 2]
+                # Instead of concatenating, associate with image index
+                img_idx_hp = i
+                hottest_points_list.append((img_idx_hp, hottest_points))
+            
+            # Handle relighting coefficients
+            if relighting_coeffs.shape[0] > 0:
+                # Relighting coeffs should be [num_boxes, 2]
+                # Instead of concatenating, associate with image index
+                img_idx_rc = i
+                relighting_coeffs_list.append((img_idx_rc, relighting_coeffs))
+
+    images = torch.stack(images, dim=0)  # [B, 3, H, W]
+    
+    # Process targets
+    if targets:
+        targets = torch.cat(targets, dim=0)  # [N_total_boxes, 6]
+    else:
+        targets = torch.zeros((0, 6), dtype=torch.float32)
+    
+            # Process keypoints
+    if keypoints_list:
+        # Create structured batch with proper dimensions
+        keypoints_batch = []
+        for img_idx, keypoints in keypoints_list:
+            keypoints_batch.append({
+                'image_idx': img_idx,
+                'keypoints': keypoints  # Shape: [num_keypoints_per_box, 2]
+            })
+    else:
+        keypoints_batch = []
+
+    # Process hottest points
+    if hottest_points_list:
+        hottest_points_batch = []
+        for img_idx, points in hottest_points_list:
+            hottest_points_batch.append({
+                'image_idx': img_idx,
+                'points': points  # Shape: [num_points, 2]
+            })
+    else:
+        hottest_points_batch = []
+
+    # Process relighting coefficients
+    if relighting_coeffs_list:
+        relighting_coeffs_batch = []
+        for img_idx, coeffs in relighting_coeffs_list:
+            relighting_coeffs_batch.append({
+                'image_idx': img_idx,
+                'coeffs': coeffs  # Shape: [num_coeffs, 2]
+            })
+    else:
+        relighting_coeffs_batch = []      
+
+    
+    return (images, targets, filenames, keypoints_batch, shapes_list, 
+            hottest_points_batch, relighting_coeffs_batch)
+
+
 def get_psgan_data(
-    dataset_path="./indonesia-traffic-signs-4",
+    dataset_path="./traffic-signs-id-2",
     img_size=640, 
     split='train',
     batch_size=32,
@@ -291,7 +388,10 @@ def get_psgan_data(
     download_params=None,
     attentive_dir=None,
     keypoints_dir=None,
-    relight_dir=None
+    relight_dir=None,
+    distributed=False, 
+    rank=0, 
+    world_size=1
 ):
     """
     Get PSGAN dataloader for YOLOv8 Roboflow dataset
@@ -324,97 +424,6 @@ def get_psgan_data(
         T.Normalize(mean=[0.5, 0.5, 0.5],
                std=[0.5, 0.5, 0.5])
     ])
-
-    def yolo_collate_fn(batch):
-        images = []
-        targets = []
-        filenames = []
-        keypoints_list = []
-        shapes_list = []
-        hottest_points_list = []
-        relighting_coeffs_list = []
-
-        for i, (img, boxes, filename, keypoints, shape, hottest_points, relighting_coeffs) in enumerate(batch):
-            images.append(img)
-            filenames.append(filename)
-            shapes_list.append(shape)
-            
-            
-            # Handle bounding boxes
-            if len(boxes) > 0:
-                # Add image index for tracking which image the boxes belong to
-                img_idx = torch.full((boxes.shape[0], 1), i, dtype=torch.float32)
-                target = torch.cat([img_idx, boxes], dim=1)  # [num_boxes, 6]
-                targets.append(target)
-                
-                # Handle keypoints
-                if keypoints.shape[0] > 0:
-                    # Keypoints should be [num_boxes, num_keypoints_per_box, 2]
-                    # We need to keep the hierarchical structure
-                    img_idx_kp = i  # Just use the integer index
-                    # Store the image index separately with the keypoints
-                    keypoints_list.append((img_idx_kp, keypoints))
-                
-                # Handle hottest points
-                if hottest_points.shape[0] > 0:
-                    # Hottest points should be [num_boxes, 2]
-                    # Instead of concatenating, associate with image index
-                    img_idx_hp = i
-                    hottest_points_list.append((img_idx_hp, hottest_points))
-                
-                # Handle relighting coefficients
-                if relighting_coeffs.shape[0] > 0:
-                    # Relighting coeffs should be [num_boxes, 2]
-                    # Instead of concatenating, associate with image index
-                    img_idx_rc = i
-                    relighting_coeffs_list.append((img_idx_rc, relighting_coeffs))
-
-        images = torch.stack(images, dim=0)  # [B, 3, H, W]
-        
-        # Process targets
-        if targets:
-            targets = torch.cat(targets, dim=0)  # [N_total_boxes, 6]
-        else:
-            targets = torch.zeros((0, 6), dtype=torch.float32)
-        
-                # Process keypoints
-        if keypoints_list:
-            # Create structured batch with proper dimensions
-            keypoints_batch = []
-            for img_idx, keypoints in keypoints_list:
-                keypoints_batch.append({
-                    'image_idx': img_idx,
-                    'keypoints': keypoints  # Shape: [num_keypoints_per_box, 2]
-                })
-        else:
-            keypoints_batch = []
-
-        # Process hottest points
-        if hottest_points_list:
-            hottest_points_batch = []
-            for img_idx, points in hottest_points_list:
-                hottest_points_batch.append({
-                    'image_idx': img_idx,
-                    'points': points  # Shape: [num_points, 2]
-                })
-        else:
-            hottest_points_batch = []
-
-        # Process relighting coefficients
-        if relighting_coeffs_list:
-            relighting_coeffs_batch = []
-            for img_idx, coeffs in relighting_coeffs_list:
-                relighting_coeffs_batch.append({
-                    'image_idx': img_idx,
-                    'coeffs': coeffs  # Shape: [num_coeffs, 2]
-                })
-        else:
-            relighting_coeffs_batch = []      
-
-        
-        return (images, targets, filenames, keypoints_batch, shapes_list, 
-                hottest_points_batch, relighting_coeffs_batch)
-    
     psgan_dataset = PSGANDataset(
         dataset_path=dataset_path, 
         split=split,
@@ -424,14 +433,31 @@ def get_psgan_data(
         relight_dir=relight_dir
     )
     
-    psgan_dataloader = DataLoader(
-        psgan_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        collate_fn=yolo_collate_fn, 
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False
-    )
+    if distributed:
+        sampler = DistributedSampler(
+            psgan_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        psgan_dataloader = DataLoader(
+            psgan_dataset, 
+            batch_size=batch_size, 
+            sampler=sampler,  # Use sampler instead of shuffle
+            shuffle=False,    # Don't use shuffle when using sampler
+            collate_fn=yolo_collate_fn, 
+            num_workers=num_workers,
+            pin_memory=False
+        )
+    else:
+        psgan_dataloader = DataLoader(
+            psgan_dataset, 
+            batch_size=batch_size, 
+            shuffle=True,
+            collate_fn=yolo_collate_fn, 
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=True if num_workers > 0 else False
+        )
 
     return psgan_dataloader, psgan_dataset

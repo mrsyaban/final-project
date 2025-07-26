@@ -1,0 +1,9 @@
+checkpoints*
+traffic-signs-id-2
+pretrained_models
+executor.ipynb
+generated_patches*
+logging
+debug*
+*ipynb_checkpoints*
+*__pycache__*

@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 from torch.utils.data import DataLoader
 from torchvision import transforms
 import matplotlib.pyplot as plt
+from torch.utils.data.distributed import DistributedSampler
 
 class QuickDrawPatchDataset(Dataset):
     """Dataset for loading and rendering QuickDraw sketches from Google Cloud Storage URLs."""
@@ -181,7 +182,10 @@ class QuickDrawPatchDataset(Dataset):
 def get_seed_patch_data(
   patch_size=56, 
   batch_size=32,
-  num_workers=8
+  num_workers=8,
+  distributed=False, 
+  rank=0, 
+  world_size=1
 ):
     # Define transformations
     transform = transforms.Compose([
@@ -215,14 +219,32 @@ def get_seed_patch_data(
         max_sketches_per_file=401,
     )
 
-    # Create dataloader
-    seed_patch_dataloader = DataLoader(
-        seed_patch_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=num_workers,  # Increase worker threads (adjust based on CPU cores)
-        pin_memory=True,  # Speed up host to GPU transfers
-        persistent_workers=True
-    )
+    if distributed:
+        sampler = DistributedSampler(
+            seed_patch_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        
+        seed_patch_dataloader = DataLoader(
+            seed_patch_dataset,
+            batch_size=batch_size,
+            sampler=sampler,
+            shuffle=False,
+            num_workers=num_workers,  # Increase worker threads (adjust based on CPU cores)
+            pin_memory=False,  # Speed up host to GPU transfers
+            persistent_workers=True
+        )
+    else:
+        # Create dataloader
+        seed_patch_dataloader = DataLoader(
+            seed_patch_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=num_workers,  # Increase worker threads (adjust based on CPU cores)
+            pin_memory=True,  # Speed up host to GPU transfers
+            persistent_workers=True
+        )
 
     return seed_patch_dataloader, seed_patch_dataset

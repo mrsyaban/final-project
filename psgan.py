@@ -7,7 +7,7 @@ import os
 from models.generator import Generator
 from models.discriminator import Discriminator
 from models.attention import AttentionModel
-
+import torch.distributed as dist
 
 class PSGAN:
     def __init__(
@@ -16,36 +16,58 @@ class PSGAN:
         image_size=640, 
         device=None, 
         lambda_patch=0.01,
-        gamma_adv=0.1,
+        gamma_adv=1.0,
+        sigma_gan=1.0,
         patch_area_ratio=0.05,
-        distortion_threshold=50
+        distortion_threshold=50,
+        distributed=False,
+        local_rank=-1
     ):
         """
         Initialize the PS-GAN model.
         """
-        self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.device = device if device is not None else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        self.distributed = distributed
+        self.local_rank = local_rank
+        self.device = device if device is not None else torch.device(f"cuda:{local_rank}" if distributed else "cuda")
+        
         self.patch_size = patch_size
         self.image_size = image_size
         self.lambda_patch = lambda_patch
         self.gamma_adv = gamma_adv
+        self.sigma_gan = sigma_gan
         self.patch_area_ratio = patch_area_ratio
         self.distortion_threshold = distortion_threshold
 
         self.generator = Generator(input_channels=3, output_channels=3, input_size=patch_size).to(self.device)
         self.discriminator = Discriminator(input_channels=3, input_size=image_size).to(self.device)
         self.attention_model = AttentionModel(image_size=image_size)
+
+        if self.distributed:
+            self.generator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.generator)
+            self.discriminator = torch.nn.SyncBatchNorm.convert_sync_batchnorm(self.discriminator)
+            self.generator = torch.nn.parallel.DistributedDataParallel(
+                self.generator, device_ids=[local_rank], output_device=local_rank
+            )
+            self.discriminator = torch.nn.parallel.DistributedDataParallel(
+                self.discriminator, device_ids=[local_rank], output_device=local_rank
+            )
         
         # Print model parameter counts
         generator_params = sum(p.numel() for p in self.generator.parameters())
         discriminator_params = sum(p.numel() for p in self.discriminator.parameters())
-        print(f"Generator parameters: {generator_params:,}")
-        print(f"Discriminator parameters: {discriminator_params:,}")
+
+        if local_rank==0:
+            print(f"Generator parameters: {generator_params:,}")
+            print(f"Discriminator parameters: {discriminator_params:,}")
 
 
         # Initialize optimizers
         self.d_optimizer = None
         self.g_optimizer = None
         self.steps = 0
+        self.epoch = 0
 
             # Store previous weights for tracking changes
         self.prev_g_weights = None
@@ -56,7 +78,7 @@ class PSGAN:
         self.d_optimizer = optim.SGD(self.discriminator.parameters(), lr=d_lr, momentum=0.9)
         self.g_optimizer = optim.Adam(self.generator.parameters(), lr=g_lr, betas=(0.5, 0.999))
         
-        self.lr_decay_steps = 900  # Decrease LR every 900 steps
+        self.lr_decay_steps = 20  # Decrease LR every 30 epochs
         self.lr_decay_rate = 0.9   # Decrease by 10% (multiply by 0.9)
         
         # Store initial learning rates to track changes
@@ -65,9 +87,9 @@ class PSGAN:
     
     def adjust_learning_rate(self):
         """Decrease learning rate by 10% every 900 steps"""
-        self.steps += 1
+        self.epoch += 1
         
-        if self.steps % self.lr_decay_steps == 0:
+        if self.epoch % self.lr_decay_steps == 0:
             # Calculate new learning rates
             for param_group in self.d_optimizer.param_groups:
                 param_group['lr'] *= self.lr_decay_rate
@@ -78,22 +100,24 @@ class PSGAN:
             current_d_lr = self.d_optimizer.param_groups[0]['lr']
             current_g_lr = self.g_optimizer.param_groups[0]['lr']
             
-            print(f"Step {self.steps}: Reducing learning rates - D_lr={current_d_lr:.6f}, G_lr={current_g_lr:.6f}")
+            print(f"Epoch {self.epoch}: Reducing learning rates - D_lr={current_d_lr:.6f}, G_lr={current_g_lr:.6f}")
         
 
     # --- Loss Components ---
-    def gan_loss_fn(self, real_images, fake_images):
+    def gan_loss_fn(self, real_images, fake_images, real_label_smooth=0.9, fake_label_smooth=0.1):
         """
         Binary cross entropy loss for GAN training.
         """
                 # Real images
         pred_real = self.discriminator(real_images)
-        real_labels = torch.ones_like(pred_real, device=self.device)
+        # real_labels = torch.ones_like(pred_real, device=self.device)
+        real_labels = torch.full_like(pred_real, real_label_smooth, device=self.device)
         loss_real = F.binary_cross_entropy(pred_real, real_labels)
 
         # Fake images (adversarial images)
         pred_fake = self.discriminator(fake_images)  # Detach to avoid training generator
-        fake_labels = torch.zeros_like(pred_fake, device=self.device)
+        # fake_labels = torch.zeros_like(pred_fake, device=self.device)
+        fake_labels = torch.full_like(pred_fake, fake_label_smooth, device=self.device)
         loss_fake = F.binary_cross_entropy(pred_fake, fake_labels)
         
         total_loss = (loss_real + loss_fake) * 0.5
@@ -117,6 +141,8 @@ class PSGAN:
         yolo_loss = target_model.compute_adv_loss(
             adv_images,
             target_labels, 
+            debug = self.steps % 10 == 0,
+            debug_prefix=f"epoch{self.epoch+1}"
             )
         # yolo_loss = target_model.compute_loss(
         #     adv_images,
@@ -152,11 +178,11 @@ class PSGAN:
         """
         
         # GAN loss: fool discriminator
-        # pred_fake = self.discriminator(adv_images)
-        # real_labels = torch.ones_like(pred_fake, device=self.device)
-        # loss_gan = F.binary_cross_entropy(pred_fake, real_labels)
+        pred_fake = self.discriminator(adv_images)
+        real_labels = torch.ones_like(pred_fake, device=self.device)
+        loss_gan = F.binary_cross_entropy(pred_fake, real_labels)
 
-        loss_gan = self.gan_loss_fn(adv_images, real_images)
+        # loss_gan = self.gan_loss_fn(adv_images, real_images)
 
         # Patch distortion loss
         loss_patch = self.patch_loss(seed_patches, adv_patches)
@@ -164,7 +190,7 @@ class PSGAN:
         # Adversarial loss (YOLO)
         loss_adv = self.adv_loss(target_model, adv_images, target_labels)
 
-        total_loss = self.lambda_patch*loss_gan + self.lambda_patch * loss_patch + self.gamma_adv * loss_adv
+        total_loss = self.sigma_gan*loss_gan + self.lambda_patch * loss_patch + self.gamma_adv * loss_adv
         # total_loss = self.lambda_patch * loss_patch + self.gamma_adv * loss_adv
 
         return total_loss, {
@@ -173,7 +199,7 @@ class PSGAN:
             'adv_loss': loss_adv.item(),
         }
 
-    def _create_adversarial_images(self, target_images, target_labels, adv_patches, hottest_points, keypoints, shape, combine=True):
+    def _create_adversarial_images(self, target_images, target_labels, adv_patches, patch_masks, relight_coeffs, combine=True):
         """
         Create adversarial images using the updated attention model.
         
@@ -189,17 +215,17 @@ class PSGAN:
         """
         batch_size = target_images.size(0)
         
-        with torch.no_grad():
-            # attention_maps = self.attention_model.generate_attention_map(target_images, target_labels)
+        # with torch.no_grad():
+        #     # attention_maps = self.attention_model.generate_attention_map(target_images, target_labels)
 
-            # # Generate patch masks based on attention maps and labels
-            # patch_masks, patch_sizes = self.attention_model.generate_patch_mask(
-            #     attention_maps, target_labels, patch_area_ratio=self.patch_area_ratio
-            # )
+        #     # # Generate patch masks based on attention maps and labels
+        #     # patch_masks, patch_sizes = self.attention_model.generate_patch_mask(
+        #     #     attention_maps, target_labels, patch_area_ratio=self.patch_area_ratio
+        #     # )
 
-            patch_masks = self.attention_model.generate_patch_mask_v2(
-                target_labels, hottest_points, keypoints, shape, patch_area_ratio=self.patch_area_ratio
-            )
+        #     patch_masks = self.attention_model.generate_patch_mask_v2(
+        #         target_labels, hottest_points, keypoints, shape, patch_area_ratio=self.patch_area_ratio
+        #     )
             
         # Create m² adversarial images by applying each patch to each image
         adv_images_list = []
@@ -212,7 +238,19 @@ class PSGAN:
                     single_image = target_images[i:i+1].clone()
                     single_patch = adv_patches[j:j+1]
                     single_mask = patch_masks[i:i+1]  # Use mask from image i
-                    
+                   
+                    # --- Relight patch using relight_coeffs ---
+                    if relight_coeffs is not None:
+                        coeff = relight_coeffs[i]['coeffs'].squeeze()  # tensor([alpha, beta])
+                        alpha = coeff[0, 0].item() if coeff.ndim == 2 else coeff[0].item()
+                        beta = coeff[0, 1].item() if coeff.ndim == 2 else coeff[1].item()
+                        # Convert patch from [-1,1] to [0,1]
+                        single_patch_01 = (single_patch + 1) / 2
+                        # Apply relighting
+                        single_patch_01 = alpha * single_patch_01 + beta
+                        # Convert back to [-1,1]
+                        single_patch = single_patch_01 * 2 - 1
+                        
                     # Apply patch j to image i using mask from image i
                     adv_img = self.attention_model.apply_patch(single_image, single_mask, single_patch)
                     adv_images_list.append(adv_img)
@@ -223,7 +261,18 @@ class PSGAN:
                 single_image = target_images[i:i+1].clone()
                 single_patch = adv_patches[i:i+1]
                 single_mask = patch_masks[i:i+1]
-                
+
+                if relight_coeffs is not None:
+                    coeff = relight_coeffs[i]['coeffs'].squeeze()  # tensor([alpha, beta])
+                    alpha = coeff[0, 0].item() if coeff.ndim == 2 else coeff[0].item()
+                    beta = coeff[0, 1].item() if coeff.ndim == 2 else coeff[1].item()
+                    # Convert patch from [-1,1] to [0,1]
+                    single_patch_01 = (single_patch + 1) / 2
+                    # Apply relighting
+                    single_patch_01 = alpha * single_patch_01 + beta
+                    # Convert back to [-1,1]
+                    single_patch = single_patch_01 * 2 - 1
+
                 # Apply patch i to image i using mask from image i
                 adv_img = self.attention_model.apply_patch(single_image, single_mask, single_patch)
                 adv_images_list.append(adv_img)
@@ -247,120 +296,144 @@ class PSGAN:
 
         try:
             # Algorithm 1: Lines 4-11 (Discriminator training for k steps)
-            d_loss_total = 0.0
-            for step in range(k_steps):
-                # Line 5: sample minibatch of m images ψ_x = {x1, ..., xm}
-                target_images, target_labels, filenames, keypoints, shape, hottest_points, relighting_coeffs = next(psgan_iter)
-                
-                # Line 6: sample minibatch of m patches ψ_δ = {δ1, ..., δm}
-                seed_patches = next(seed_patch_iter)  # Note: seed patch dataloader only returns patches
+            # d_loss_total = 0.0
 
-                # Move to device
-                target_images = target_images.to(self.device)
-                target_labels = target_labels.to(self.device) if target_labels is not None else None
-                seed_patches = seed_patches.to(self.device)
-
-                # Ensure same batch size
-                batch_size = min(target_images.size(0), seed_patches.size(0))
-                target_images = target_images[:batch_size]
-                seed_patches = seed_patches[:batch_size]
-                
-                # Reindex target_labels to match the truncated batch
-                if target_labels is not None and len(target_labels) > 0:
-                    # Keep only labels for images in the current batch
-                    mask = target_labels[:, 0] < batch_size
-                    target_labels = target_labels[mask]
-                else:
-                    # Create empty labels tensor if no labels
-                    target_labels = torch.empty(0, 6).to(self.device)
-
-                # Preprocess patches if needed (convert from [0,1] to [-1,1] if using tanh activation)
-                if seed_patches.min() >= 0 and seed_patches.max() <= 1:
-                    seed_patches = seed_patches * 2 - 1
-
-                # Line 7: generate minibatch of m adversarial patches ψ_δ^G = {G(δ1), ..., G(δm)}
-                
-                adv_patches = self.generator(seed_patches)
-
-                # Line 8: obtain attention map M(ψ_x) by Grad-CAM
-                # Line 9: construct minibatch of m² adversarial images ψ_δ^G = {xi ⊕ M(xi) ○ δj |i, j = 1, ..., m}
-                
-                
-                adv_images= self._create_adversarial_images(
-                    target_images, target_labels, adv_patches, hottest_points, keypoints, shape, combine=True
-                )
-                
-                
-                # Create corresponding clean images (m² copies)
-                clean_images_list = []
-                for i in range(batch_size):  # For each image
-                    for j in range(batch_size):  # For each patch
-                        clean_images_list.append(target_images[i:i+1])
-                
-                clean_images = torch.cat(clean_images_list, dim=0)  # [m², C, H, W]
-
-                # Line 10: optimize W_D to max_D L_GAN with G fixed
-                self.discriminator.train()
-                self.d_optimizer.zero_grad()
-
-                d_loss = self.compute_discriminator_loss(clean_images, adv_images)
-                d_loss.backward()
-                self.d_optimizer.step()
-                
-                d_loss_total += d_loss.item()
-
-            # Average discriminator loss over k steps
-            metrics['d_loss'] = d_loss_total / k_steps
-
-            # Algorithm 1: Lines 12-15 (Generator training)
-            # Line 12: sample minibatch of m images ψ_x = {x1, ..., xm}
+        
+            # Line 5: sample minibatch of m images ψ_x = {x1, ..., xm}
             target_images, target_labels, filenames, keypoints, shape, hottest_points, relighting_coeffs = next(psgan_iter)
+            
+            # Line 6: sample minibatch of m patches ψ_δ = {δ1, ..., δm}
+            seed_patches = next(seed_patch_iter)  # Note: seed patch dataloader only returns patches
 
-            # Line 13: sample minibatch of m patches ψ_δ = {δ1, ..., δm}
-            seed_patches = next(seed_patch_iter)
-
-            # Move to device and ensure same batch size
+            # Move to device
             target_images = target_images.to(self.device)
             target_labels = target_labels.to(self.device) if target_labels is not None else None
             seed_patches = seed_patches.to(self.device)
 
+            # Ensure same batch size
             batch_size = min(target_images.size(0), seed_patches.size(0))
             target_images = target_images[:batch_size]
             seed_patches = seed_patches[:batch_size]
-
-            # Reindex target_labels again
+            
+            # Reindex target_labels to match the truncated batch
             if target_labels is not None and len(target_labels) > 0:
+                # Keep only labels for images in the current batch
                 mask = target_labels[:, 0] < batch_size
                 target_labels = target_labels[mask]
             else:
+                # Create empty labels tensor if no labels
                 target_labels = torch.empty(0, 6).to(self.device)
 
-            # Preprocess patches
+            # Preprocess patches if needed (convert from [0,1] to [-1,1] if using tanh activation)
             if seed_patches.min() >= 0 and seed_patches.max() <= 1:
                 seed_patches = seed_patches * 2 - 1
 
-            # Generate adversarial patches with gradients
+            # Line 7: generate minibatch of m adversarial patches ψ_δ^G = {G(δ1), ..., G(δm)}
+            
             adv_patches = self.generator(seed_patches)
 
-            # Create adversarial images for generator training
-            adv_images = self._create_adversarial_images(
-                target_images, target_labels, adv_patches, hottest_points, keypoints, shape, combine=False
+            # Line 8: obtain attention map M(ψ_x) by Grad-CAM
+            # Line 9: construct minibatch of m² adversarial images ψ_δ^G = {xi ⊕ M(xi) ○ δj |i, j = 1, ..., m}
+
+            with torch.no_grad():
+                patch_masks = self.attention_model.generate_patch_mask_v2(
+                    target_labels, hottest_points, keypoints, shape, patch_area_ratio=self.patch_area_ratio
+                )
+            
+            adv_images= self._create_adversarial_images(
+                target_images, target_labels, adv_patches, patch_masks, relighting_coeffs, combine=True
             )
+            
+            # clean_images= self._create_adversarial_images(
+            #     target_images, target_labels, seed_patches, patch_masks, relighting_coeffs, combine=True
+            # )
+            
+            
+            # # Create corresponding clean images (m² copies)
+            clean_images_list = []
+            for i in range(batch_size):  # For each image
+                for j in range(batch_size):  # For each patch
+                    clean_images_list.append(target_images[i:i+1])
+            
+            clean_images = torch.cat(clean_images_list, dim=0)  # [m², C, H, W]
+            
+            # import pdb; pdb.set_trace()
+            # Line 10: optimize W_D to max_D L_GAN with G fixed
+            self.discriminator.train()
+            self.d_optimizer.zero_grad()
 
-            # Line 15: optimize W_G to min_G L_GAN + λ L_patch + γ L_adv with D fixed
-            self.generator.train()
-            self.g_optimizer.zero_grad()
+            d_loss = self.compute_discriminator_loss(clean_images, adv_images)
+            d_loss.backward()
+            self.d_optimizer.step()
+            
+            # d_loss_total += d_loss.item()
+            
+            # Average discriminator loss over k steps
+            # metrics['d_loss'] = d_loss_total / k_steps
+            metrics['d_loss'] = d_loss.item()
 
-            g_loss, loss_dict = self.compute_generator_loss(
-                adv_patches, seed_patches, adv_images, target_images, target_model, target_labels
-            )
-            g_loss.backward()
-            self.g_optimizer.step()
+            g_loss_total = 0.0
+            for step in range(k_steps):
+                # Algorithm 1: Lines 12-15 (Generator training)
+                # Line 12: sample minibatch of m images ψ_x = {x1, ..., xm}
+                target_images, target_labels, filenames, keypoints, shape, hottest_points, relighting_coeffs = next(psgan_iter)
+    
+                # Line 13: sample minibatch of m patches ψ_δ = {δ1, ..., δm}
+                seed_patches = next(seed_patch_iter)
+    
+                # Move to device and ensure same batch size
+                target_images = target_images.to(self.device)
+                target_labels = target_labels.to(self.device) if target_labels is not None else None
+                seed_patches = seed_patches.to(self.device)
+    
+                batch_size = min(target_images.size(0), seed_patches.size(0))
+                target_images = target_images[:batch_size]
+                seed_patches = seed_patches[:batch_size]
+    
+                # Reindex target_labels again
+                if target_labels is not None and len(target_labels) > 0:
+                    mask = target_labels[:, 0] < batch_size
+                    target_labels = target_labels[mask]
+                else:
+                    target_labels = torch.empty(0, 6).to(self.device)
+    
+                # Preprocess patches
+                if seed_patches.min() >= 0 and seed_patches.max() <= 1:
+                    seed_patches = seed_patches * 2 - 1
+    
+                # Generate adversarial patches with gradients
+                adv_patches = self.generator(seed_patches)
 
-            self.adjust_learning_rate()
+                with torch.no_grad():
+                    patch_masks = self.attention_model.generate_patch_mask_v2(
+                        target_labels, hottest_points, keypoints, shape, patch_area_ratio=self.patch_area_ratio
+                    )
+    
+                # Create adversarial images for generator training
+                adv_images = self._create_adversarial_images(
+                    target_images, target_labels, adv_patches, patch_masks, relighting_coeffs, combine=False
+                )
+                
+                # clean_images = self._create_adversarial_images(
+                #     target_images, target_labels, seed_patches, patch_masks, relighting_coeffs, combine=False
+                # )
+    
+                # Line 15: optimize W_G to min_G L_GAN + λ L_patch + γ L_adv with D fixed
+                self.generator.train()
+                self.g_optimizer.zero_grad()
+    
+                g_loss, loss_dict = self.compute_generator_loss(
+                    adv_patches, seed_patches, adv_images, target_images, target_model, target_labels
+                )
+                g_loss.backward()
+                self.g_optimizer.step()
+
+                g_loss_total += g_loss.item()
+
 
             # Update metrics
-            metrics['g_loss'] = g_loss.item()
+            # metrics['g_loss'] = g_loss.item()
+            metrics['g_loss'] = g_loss_total / k_steps
             metrics.update(loss_dict)
 
             return metrics
@@ -386,6 +459,7 @@ class PSGAN:
         g_lr=0.0002,
         save_interval=None,
         save_path=None,
+        log_path=None,
         lambda_decay=True,
         verbose=True
     ):
@@ -412,21 +486,30 @@ class PSGAN:
 
         original_lambda_patch = self.lambda_patch
 
-        print(f"Starting training for {epochs} epochs...")
-        if lambda_decay:
-            print(f"Lambda decay enabled: reducing lambda_patch by 5% every 10 epochs")
-            print(f"Initial lambda_patch: {self.lambda_patch:.6f}")
+        if verbose:
+            print(f"Starting training for {epochs} epochs...")
+            if lambda_decay:
+                print(f"Lambda decay enabled: reducing lambda_patch by 5% every 10 epochs")
+                print(f"Initial lambda_patch: {self.lambda_patch:.6f}")
+        
+        is_distributed = dist.is_available() and dist.is_initialized()
+        rank = dist.get_rank() if is_distributed else 0
         
         # Algorithm 1: Line 3 - for the number of training epochs do
         for epoch in range(epochs):
+            self.epoch = epoch
+            self.adjust_learning_rate()
             if lambda_decay and (epoch + 1) % 10 == 0:
                 self.lambda_patch *= 0.95  # Reduce by 5%
                 if verbose:
                     print(f"\nEpoch {epoch + 1}: Lambda decay applied")
                     print(f"New lambda_patch: {self.lambda_patch:.6f}")
             if verbose:
-                print(f"\nEpoch {epoch + 1}/{epochs} (lambda_patch: {self.lambda_patch:.6f})")
-            
+                print(f"\nEpoch {epoch + 1}/{epochs}")
+
+            if is_distributed:
+                seed_patch_dataloader.sampler.set_epoch(epoch)
+                psgan_dataloader.sampler.set_epoch(epoch)
             # Reset dataloaders for each epoch
             seed_patch_iter = iter(seed_patch_dataloader)
             psgan_iter = iter(psgan_dataloader)
@@ -457,6 +540,7 @@ class PSGAN:
                 step_count += 1
                 
                 if verbose and step_count % 10 == 0:
+                    self.steps = step_count
                     g_weight_change, d_weight_change = self.calculate_weight_changes()
     
                     print(f"  Step {step_count}: D_loss={step_metrics['d_loss']:.4f}, "
@@ -478,6 +562,15 @@ class PSGAN:
                     'adv_loss': epoch_adv_loss / step_count,
                     'steps': step_count
                 }
+
+                                # --- Distributed averaging across all GPUs ---
+                if is_distributed:
+                    for key in ['d_loss', 'g_loss', 'gan_loss', 'patch_loss', 'adv_loss', 'steps']:
+                        tensor = torch.tensor(avg_metrics[key], device=self.device, dtype=torch.float64)
+                        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+                        avg_metrics[key] = tensor.item() / dist.get_world_size()
+                # ------------
+                
                 epoch_metrics.append(avg_metrics)
                 
                 if verbose:
@@ -488,6 +581,16 @@ class PSGAN:
                     print(f"  Average Patch_loss: {avg_metrics['patch_loss']:.4f}")
                     print(f"  Average Adv_loss: {avg_metrics['adv_loss']:.4f}")
                     print(f"  Total steps: {step_count}")
+
+                    log_file = os.path.join(log_path if log_path else "./psgan_train_log.txt")
+                    with open(log_file, "a") as f:
+                        f.write(f"Epoch {epoch + 1} Summary:\n")
+                        f.write(f"  Average D_loss: {avg_metrics['d_loss']:.4f}\n")
+                        f.write(f"  Average G_loss: {avg_metrics['g_loss']:.4f}\n")
+                        f.write(f"  Average GAN_loss: {avg_metrics['gan_loss']:.4f}\n")
+                        f.write(f"  Average Patch_loss: {avg_metrics['patch_loss']:.4f}\n")
+                        f.write(f"  Average Adv_loss: {avg_metrics['adv_loss']:.4f}\n")
+                        f.write(f"  Total steps: {step_count}\n")
             
             # Save model if requested
             if save_interval is not None and save_path is not None and (epoch + 1) % save_interval == 0:
